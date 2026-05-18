@@ -1,0 +1,12 @@
+# Bytecode
+__pycache__/
+*.pyc
+
+# Databases (generated at runtime)
+*.db
+
+# Environment files (keep .env.example)
+.env
+
+# Claude Code local config
+.claude/
