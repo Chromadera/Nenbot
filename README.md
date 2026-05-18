@@ -442,7 +442,7 @@ ps aux | grep 'main.py'
 
 **Unicode in sed.** Comments in `main.py` use em-dashes (UTF-8 `e2 80 94`). Shell `sed` commands that try to match these will fail silently. Use Python for patching when comments contain non-ASCII characters.
 
-*For the love of God, use html parsing for your telegram bot, escpaing in Markdown is a terribly stressful thing to do.Dont be retarded like me. 
+*For the love of God, use html parsing for your telegram bot, escaping in Markdown is a terribly stressful thing to do.Dont be retarded like me. 
 ---
 
 
