@@ -8,5 +8,4 @@ __pycache__/
 # Environment files (keep .env.example)
 .env
 
-# Claude Code local config
-.claude/
+
