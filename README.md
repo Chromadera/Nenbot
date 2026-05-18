@@ -118,13 +118,14 @@ The **Transition Engine** manages mode switches when the bot has an open positio
 
 ### Signal Pipeline
 
-All quoting decisions flow through a 5-stage signal pipeline that produces `SignalWeights` — multipliers in [0.0, 2.0] for each side:
+All quoting decisions flow through a 6-stage signal pipeline that produces `SignalWeights` — multipliers in [0.0, 2.0] for each side:
 
 1. **RSI extreme filter** — hard blocks at overbought/oversold
 2. **VWAP distance** — reduces unfavourable side when far from VWAP
 3. **Regime tilt** — amplifies with-trend, dampens against-trend
-4. **OFI confirmation** — order flow imbalance fine-tunes entry timing
-5. **Post-stop cooldown** — blocks same-direction re-entry after a stop
+4. **Signal conflict detection** — compares regime direction against order flow imbalance (OFI). When they disagree (e.g., trending up but OFI is negative), the conflict score goes negative. Hard conflict (score ≤ `-SIGNAL_CONFLICT_THRESHOLD`, default `-0.3`) triggers a full no-trade block on both sides. Mild conflict (score ≤ `-threshold/2`) dampens both long and short weights toward neutral. Only active in trending regime — ranging has no directional bias to conflict with.
+5. **OFI confirmation** — order flow imbalance fine-tunes entry timing. When OFI and regime agree, the combined multiplier is amplified by 1.2×; when they disagree it's dampened by 0.8×. Capped at 1.4×.
+6. **Post-stop cooldown** — blocks same-direction re-entry after a stop. Cooldown lifts automatically if the regime changes since the stop occurred.
 
 ### Regime Detection
 
@@ -139,23 +140,46 @@ Uses ADX with hysteresis to prevent rapid flipping:
 The Quoter computes fair price and spread from:
 - Binance feed price (primary reference) blended with Hotstuff BBO
 - Inventory-aware skew — three tiers (normal, skew, one-sided) based on position size relative to max inventory
-- Adverse selection floor — dynamically adjusted by markout feedback
+- Adverse selection floor — dynamically adjusted by markout feedback (see MarkoutAdjuster below)
 - OFI shift — up to 8bps mid-price adjustment based on order flow imbalance
-- Trend blocking — hard blocks when inventory is against strong trend
+- Trend blocking with OFI hysteresis — blocks the against-trend side when OFI confirms trend strength. Uses asymmetric on/off thresholds (`TREND_BLOCK_ON=0.15`, `TREND_BLOCK_OFF=0.05`) to prevent rapid toggling
+- **Flip prevention** — when `HOTSTUFF_ALLOW_FLIPS` is `false` and a position is open, only the closing side is posted (the bot never adds to a position)
+- **Regime-aware passive limit close** — in directional mode with an open position, the bracket close order is periodically replaced with a tighter regime-aware limit: 2bps in ranging (quick mean-reversion close), 6bps in trending (let winners run). This is a maker close that earns rebates.
+- **Regime inventory scaling** — in trending regimes, `max_inventory_multiplier()` returns 0.5, halving max inventory to reduce trend-fighting risk
 
 ### Risk Management
 
 **DrawdownMonitor** — tracks daily PnL with three stress levels:
 - Level 0 (< 50% of max loss): normal operation
-- Level 1 (50–80%): reduces position sizes proportionally
-- Level 2 (> 80%): halts all new orders; requires manual `/override` to resume
+- Level 1 (50–75%): reduces position sizes proportionally
+- Level 2 (> 75%): halts all new orders; requires manual `/override` to resume
 
 **MarkoutTracker** — measures fill quality at 10s/30s/60s/5m intervals. Feeds back into the adverse selection floor — if fills are getting picked off, the spread widens automatically. Uses per-market, per-direction ATR-normalised floors.
+
+**MarkoutAdjuster** — a companion to MarkoutTracker that dynamically adjusts the adverse selection floor based on recent fill quality. Uses a bootstrap phase (30 fills minimum), Z-score against a 50-fill baseline window, sigmoid-scaled adjustment, and EMA-smoothed ATR scaling. Maintains separate rolling windows and Z-scores for long and short fills within each market (20-fill recent window).
 
 **Grid SL System** — three-phase inventory protection in grid mode:
 - Phase 1: Overshoot detected → passive reduce order
 - Phase 2: TTL expires → replace or escalate
 - Phase 3: Loss exceeds threshold → immediate market close
+
+**Grid Watchdog** — three-level stall detection that monitors grid rebalance staleness: Level 1 (120s) force-requeues the market's BBO; Level 2 (180s) force-requeues all markets; Level 3 (2 consecutive triggers) restarts the entire bot process via SIGTERM.
+
+**Dust auto-close** — positions between `min_notional` and `min_notional × 1.5` are automatically market-closed as dust. Positions below `min_notional` are treated as flat.
+
+**Bracket gap escalation** — if the mid price gaps past the stop level by more than 5bps, the bot escalates from a passive stop to an immediate market reduce.
+
+**Bracket TTL replacement** — brackets expire after 5 minutes. On expiry, the bot re-places the bracket and trails the stop in the profitable direction (never extends against the position).
+
+**Market reduce throttle** — non-urgent market reduces are throttled to once per 30 seconds per market; urgent reduces (grid SL or transition timeout) to once per second.
+
+**Fill cooldown** — after a fill on a side, that side is blocked from requoting for 2 seconds to prevent immediate refill at a worse price.
+
+**Post-stop cooldown with regime lift** — a stop in one direction blocks same-direction re-entry. The cooldown lifts automatically if the market regime has changed since the stop occurred, on the assumption the old signal is no longer valid.
+
+**SIGUSR1/SIGUSR2 handlers** — the bot responds to signals for remote control:
+- `SIGUSR1`: resumes a drawdown-halted bot
+- `SIGUSR2`: market-closes all positions then shuts down (used by admin suspend-all and close-all commands)
 
 ---
 
@@ -174,7 +198,7 @@ Everything runs under a single `systemd` unit: `nenmmbot.service`. This starts `
 
 Each user bot runs as an independent Python process with:
 - Own directory: `/root/bots/user_{telegram_id}_{label}/`
-- Own `.env` file with encrypted agent key, market config, risk parameters
+- Own `.env` file with market config and risk parameters (agent key is injected via process environment, never written to disk)
 - Own `hotstuff.db` SQLite database for fills, snapshots, placed orders
 - Own log file: `bot.log`
 
@@ -184,7 +208,7 @@ The bot template lives at `/root/saas/bot_template/bot/`. Changes are deployed b
 
 `feed.py` runs one WebSocket connection per market to Hotstuff and broadcasts BBO updates via Unix domain sockets (`/tmp/nenfeed_{MARKET}.sock`). All user bots connect as clients via `FeedReader` in `exchange.py`. This eliminates redundant WebSocket connections — instead of "n" bots × 15 markets = 15n connections, the platform uses 15 feed connections + n fills subscriptions.
 
-Each bot's `exchange.py` has fallback logic: if the feed socket is unavailable for a market, it opens a direct WebSocket to Hotstuff for that market's BBO.
+Each bot's `exchange.py` has fallback logic: if the feed socket is unavailable at startup for a market, it opens a direct WebSocket to Hotstuff for that market's BBO. The feed's markets are configured via the `NENFEED_MARKETS` env var (comma-separated list, defaults to `BTC-PERP,ETH-PERP,SOL-PERP,HYPE-PERP`).
 
 ### Threading Model (Per Bot)
 
@@ -262,16 +286,42 @@ manager.py spawns bot process
 | `/start` | Onboarding, referral link |
 | `/setup` | Add first wallet (agent key + label) |
 | `/addwallet` | Add additional wallet |
+| `/removewallet` | Remove an existing wallet |
+| `/renewkey` | Replace an existing agent private key |
 | `/status` | All wallets with inline action buttons |
 | `/dash [label]` | Full stats dashboard — PnL, volume, win rate, drawdown |
 | `/config [label]` | Profile switcher (Conservative/Balanced/Aggressive) + expert mode |
 | `/stop` / `/resume` | Bot lifecycle control |
+| `/close` | Market-close open position and stop the bot |
 | `/override` | Resume after drawdown halt |
+| `/modes` | Explains Grid vs Trend mode, signal conflict, markout filter, and how to force a mode |
+| `/analytics` | Multi-tab analytics view (Performance/Quality) with period selectors (today/7d/alltime) |
 | `/volume` / `/pnl` / `/points` / `/balance` | Quick stat lookups |
+| `/pointsvalue` | Points value calculator with FDV scenario projections |
+| `/logs` | Last 30 lines of the bot's log file |
+| `/help` | Lists all available user commands |
 
-### Admin Toolkit (26+ commands)
+### Admin Toolkit (25 commands)
 
-The admin (Telegram ID `yourtgID`) has access to platform-wide commands including: suspend/resume all bots, broadcast messages, view all user stats, force restart individual bots, modify user configs, run diagnostics, and manage referrals.
+| Command | Function |
+|---|---|
+| `/admin_platform` | Platform-wide analytics: volume, PnL, fees, per-user rankings, latency |
+| `/admin_analytics <tid> <label>` | Per-user fill data, points, and performance/quality view |
+| `/admin_feed` | Shared feed Unix socket health per market + systemd status |
+| `/admin_botstate <tid> <label>` | Live bot internals: regime, OFI, recent orders, last fill, snapshot |
+| `/admin_suspendall` | Maintenance shutdown: SIGUSR2 all bots, exchange-level cancel-all |
+| `/admin_unsuspendall` | Resume all suspended bots and notify users |
+| `/admin_suspensions [tid]` | Audit log of suspension/resume events |
+| `/admin_closeall` | Market-close all bot positions, wait 15s, force-stop stragglers |
+| `/admin_referrals` | Referral API data, per-user fees/rewards, points value calculator |
+| `/admin_losses <threshold>` | List bots whose drawdown exceeds a given USD threshold |
+| `/admin_orphans` | List bot directories on disk with no matching DB entry |
+| `/admin_cleandir <tid> <label>` | Archive bot DB then remove orphan directory |
+| `/admin_poll <q> \| <opt1> \| <opt2>` | Send a Telegram poll to all registered users |
+| `/admin_broadcast` | Broadcast a message to all users |
+| `/admin_restart <tid> <label>` | Force restart an individual bot |
+| `/admin_config <tid> <label>` | View or modify a user's bot configuration |
+| `/admin_diag <tid> <label>` | Run diagnostics on a specific bot |
 
 ### Profile System
 
@@ -280,7 +330,50 @@ Three preset profiles control risk parameters:
 - **Balanced** — moderate parameters
 - **Aggressive** — wider spreads, larger sizes, higher caps
 
-Users can also enter **Expert Mode** to override individual parameters: grid spacing, grid levels, grid V-shape, grid min spacing, overshoot multiplier, max loss %, and more.
+Users can also enter **Expert Mode** to override individual parameters:
+
+| Parameter | Env Var | Description |
+|---|---|---|
+| Order size (USD) | `{PREFIX}_ORDER_SIZE_USD` | Per-market order size (default 100) |
+| Max inventory (USD) | `{PREFIX}_MAX_INVENTORY_USD` | Per-market max position size (default 300) |
+| Spread | `{PREFIX}_SPREAD` | Per-market open spread fraction (default 0.002 = 20bps) |
+| Close spread | `{PREFIX}_CLOSE_SPREAD` | Per-market close spread fraction (default 0.0005 = 5bps) |
+| Max daily loss (USD) | `HOTSTUFF_MAX_DAILY_LOSS` | Daily drawdown cap (default 20) |
+| Leverage | `HOTSTUFF_LEVERAGE` | Position leverage multiplier (default 50) |
+| Allow flips | `HOTSTUFF_ALLOW_FLIPS` | Allow adding to a position (default true) |
+| Stop loss margin | `HOTSTUFF_STOP_LOSS_MARGIN` | Margin multiplier for stop distance (default 0.015) |
+| Fill cooldown (open) | `FILL_COOLDOWN_OPEN_S` | Seconds to block requote after an open fill (default 20) |
+| Fill cooldown (close) | `FILL_COOLDOWN_CLOSE_S` | Seconds to block after a close fill (default 2) |
+| Time-of-day multipliers | `TOD_08_MULTIPLIER`, `TOD_13_MULTIPLIER`, `TOD_14_MULTIPLIER` | Spread multipliers for high-volatility periods (default 2.5, 2.0, 2.0) |
+| ADX threshold | `HOTSTUFF_ADX_TREND_THRESHOLD` | ADX value to enter trending regime (default 25) |
+| Requote cooldown | `HOTSTUFF_REQUOTE_COOLDOWN` | Seconds between cancel and requote (default 0.5) |
+| Price move threshold | `HOTSTUFF_PRICE_MOVE_THRESHOLD` | Fractional change to trigger requote (default 0.0001) |
+| Order TTL (ms) | `HOTSTUFF_ORDER_TTL_MS` | Time before forced requote (default 60000) |
+| Profit target (bps) | `HOTSTUFF_PROFIT_TARGET_BPS` | Profit target spread for quoting (default 5.0) |
+| Adverse selection (bps) | `HOTSTUFF_ADVERSE_SELECTION_BPS` | Static adverse selection floor (default 0.27) |
+| Signal conflict (bps) | `HOTSTUFF_SIGNAL_CONFLICT_BPS` | Regime-vs-OFI conflict threshold (default 0.3; 0 = disabled) |
+| Grid levels | `HOTSTUFF_GRID_LEVELS` | Number of grid levels per side (default 5) |
+| Grid spacing (ATR mult) | `HOTSTUFF_GRID_SPACING_ATR_MULT` | Grid spacing = ATR × multiplier (default 0.5) |
+| Grid V-shape alpha | `HOTSTUFF_GRID_VSHAPE_ALPHA` | 0 = uniform sizes, higher = outer levels larger (default 0.4) |
+| Grid min spacing | `HOTSTUFF_GRID_MIN_SPACING_PCT` | Floor as fraction of mid price (default 0.0005) |
+| Grid overshoot mult | `HOTSTUFF_GRID_OVERSHOOT_MULT` | Multiplier on max inventory that triggers SL (default 1.1) |
+| Grid max loss % | `HOTSTUFF_GRID_MAX_LOSS_PCT` | Unrealised loss % that triggers emergency close (default 0.02) |
+
+---
+
+## Dashboards & Tools
+
+In addition to the Telegram interface, the platform includes several standalone tools:
+
+**Rich terminal dashboard** (`bot/dashboard.py`) — full-featured live dashboard with multi-wallet support, regime panel, OFI panel, latency tracker (BBO REST quote latency + order-to-fill latency), markout analysis, PnL by market/direction/time, fee drag analysis, equity history snapshots, and a leaderboard (top 30 traders by volume across BTC/ETH/SOL/HYPE). Time windows switchable via 1-4 keys (1hr/12hr/24hr/all).
+
+**Monitor dashboard** (`bot/monitor.py`) — dedicated quadrant-layout terminal display showing Regime, OFI, Latency (p50/p95), and Markout analysis simultaneously. Reads from `regime_state.json` and `ofi_state.json` written by the running bot.
+
+**Chart server** (`bot/chart.py`) — local web server (port 8765) serving a live Plotly candlestick chart with fill markers, resolution selector (5m/15m/1h/4h), session PnL display, and 10s auto-refresh.
+
+**CLI tracker** (`bot/tracker.py`) — offline wallet analysis tool. Fetches fills, classifies strategy (Market Maker / Directional / Mixed), estimates hold time (Scalper / Short-term / Swing / Position), computes maker/taker split, PnL, directional bias, peak trading hour, and exports to CSV.
+
+**Points value calculator** — the `/pointsvalue` command and `/admin_referrals` both include a points-to-USD projector across FDV scenarios (10M–200M) and supply percentages (10–30%). An 8-tier league system (Master, Diamond, Platinum, Silver, Gold, Copper, Bronze, Iron) maps the exchange's `net_league` field to display ranks.
 
 ---
 
@@ -442,7 +535,7 @@ ps aux | grep 'main.py'
 
 **Unicode in sed.** Comments in `main.py` use em-dashes (UTF-8 `e2 80 94`). Shell `sed` commands that try to match these will fail silently. Use Python for patching when comments contain non-ASCII characters.
 
-*For the love of God, use html parsing for your telegram bot, escaping in Markdown is a terribly stressful thing to do.Dont be retarded like me. 
+*For the love of God, use html parsing for your telegram bot, escpaing in Markdown is a terribly stressful thing to do.Dont be retarded like me. 
 ---
 
 
@@ -461,4 +554,3 @@ ps aux | grep 'main.py'
 **Feed broadcast model is single-threaded and unbounded.** `feed.py` broadcasts BBO to all connected clients sequentially inside `_broadcast()`, calling `sendall()` on each socket one by one. There is no per-client send timeout — one slow consumer with a full receive buffer can stall the entire market's broadcast until the buffer drains. Every other bot on that market stops receiving updates. Client count is uncapped (the `MAX_CLIENTS = 200` constant only sets the listen backlog, not an active-connection limit). A single misbehaving bot process or a mass restart after deploy could degrade every market it's subscribed to. At scale, options worth considering: per-client send timeouts with non-blocking send + client drop, dedicated writer threads per client, or switching to UDP multicast to decouple publisher throughput from consumer health.
 
 ---
-
